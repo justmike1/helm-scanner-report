@@ -50,6 +50,19 @@ The action will:
 3. Scan each image with Trivy
 4. Generate a consolidated report sorted by severity
 5. Upload the report as a GitHub Actions artifact
+6. Optionally send the report to a Slack channel
+
+### Slack Setup
+
+To enable Slack notifications, create a [Slack App](https://api.slack.com/apps) with a Bot Token and the following **OAuth scopes**:
+
+| Scope | Purpose |
+|-------|---------|
+| `files:write` | Upload the report file |
+| `files:read` | Complete the upload flow |
+| `chat:write` | Post the message/mention in the channel |
+
+After installing the app to your workspace, **invite the bot to the target channel** (`/invite @YourBot`).
 
 ### Inputs
 
