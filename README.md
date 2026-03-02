@@ -38,6 +38,7 @@ jobs:
           log-level: "INFO"               # optional (default: INFO)
           upload-artifact: "true"         # optional (default: true)
           artifact-name: "trivy-report"   # optional (default: trivy-vulnerability-report)
+          retention-days: "3"             # optional (default: 3)
 ```
 
 The action will:
@@ -61,6 +62,7 @@ The action will:
 | `log-level` | no | `INFO` | Log level |
 | `upload-artifact` | no | `true` | Upload report as artifact |
 | `artifact-name` | no | `trivy-vulnerability-report` | Artifact name |
+| `retention-days` | no | `3` | Number of days to retain the artifact |
 
 ### Outputs
 
