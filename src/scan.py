@@ -49,7 +49,11 @@ class Vulnerability:
 
     @property
     def severity_rank(self) -> int:
-        return Severity[self.severity].value if self.severity in Severity.__members__ else 99
+        return (
+            Severity[self.severity].value
+            if self.severity in Severity.__members__
+            else 99
+        )
 
 
 @dataclass
@@ -77,7 +81,7 @@ def _fetch_epss_scores(cve_ids: list[str]) -> dict[str, float]:
     scores: dict[str, float] = {}
     batch_size = 100
     for i in range(0, len(cve_ids), batch_size):
-        batch = cve_ids[i:i + batch_size]
+        batch = cve_ids[i : i + batch_size]
         params = urllib.parse.urlencode({"cve": ",".join(batch)})
         url = f"https://api.first.org/data/v1/epss?{params}"
         try:
@@ -95,9 +99,13 @@ def _fetch_epss_scores(cve_ids: list[str]) -> dict[str, float]:
     return scores
 
 
-def _enrich_and_filter_epss(vulns: list[Vulnerability], min_epss: float | None) -> list[Vulnerability]:
+def _enrich_and_filter_epss(
+    vulns: list[Vulnerability], min_epss: float | None
+) -> list[Vulnerability]:
     """Enrich vulnerabilities with EPSS scores and optionally filter by minimum."""
-    cve_ids = [v.vulnerability_id for v in vulns if v.vulnerability_id.startswith("CVE-")]
+    cve_ids = [
+        v.vulnerability_id for v in vulns if v.vulnerability_id.startswith("CVE-")
+    ]
     if not cve_ids:
         return vulns
 
@@ -107,7 +115,9 @@ def _enrich_and_filter_epss(vulns: list[Vulnerability], min_epss: float | None) 
             v.epss_score = scores[v.vulnerability_id]
 
     if min_epss is not None:
-        vulns = [v for v in vulns if v.epss_score is not None and v.epss_score >= min_epss]
+        vulns = [
+            v for v in vulns if v.epss_score is not None and v.epss_score >= min_epss
+        ]
 
     return vulns
 
@@ -180,12 +190,19 @@ class TrivyScanner(ImageScanner):
 
         try:
             trivy_cmd = [
-                "trivy", "image", "-q",
-                "--severity", config.severity_levels,
-                "-f", "template",
-                "--template", f"@{processed_template}",
-                "-o", html_file_path,
-                "--scanners", "vuln",
+                "trivy",
+                "image",
+                "-q",
+                "--severity",
+                config.severity_levels,
+                "-f",
+                "template",
+                "--template",
+                f"@{processed_template}",
+                "-o",
+                html_file_path,
+                "--scanners",
+                "vuln",
                 image,
             ]
 
@@ -204,7 +221,9 @@ class TrivyScanner(ImageScanner):
                     )
                     time.sleep(self.RETRY_DELAY)
                 else:
-                    logging.error(f"Error running Trivy for image {image}: {result.stderr}")
+                    logging.error(
+                        f"Error running Trivy for image {image}: {result.stderr}"
+                    )
                     return None
 
             logging.error(
@@ -219,10 +238,15 @@ class TrivyScanner(ImageScanner):
         """Scan with JSON output to support EPSS filtering."""
         allowed = {s.strip().upper() for s in config.severity_levels.split(",")}
         trivy_cmd = [
-            "trivy", "image", "-q",
-            "--severity", config.severity_levels,
-            "-f", "json",
-            "--scanners", "vuln",
+            "trivy",
+            "image",
+            "-q",
+            "--severity",
+            config.severity_levels,
+            "-f",
+            "json",
+            "--scanners",
+            "vuln",
             image,
         ]
 
@@ -258,10 +282,16 @@ class TrivyScanner(ImageScanner):
         vulns = self._parse_trivy_json(data, allowed)
         vulns = _enrich_and_filter_epss(vulns, config.min_epss)
 
-        os_vulns = sorted([v for v in vulns if v.is_os_package], key=lambda v: v.severity_rank)
-        lib_vulns = sorted([v for v in vulns if not v.is_os_package], key=lambda v: v.severity_rank)
+        os_vulns = sorted(
+            [v for v in vulns if v.is_os_package], key=lambda v: v.severity_rank
+        )
+        lib_vulns = sorted(
+            [v for v in vulns if not v.is_os_package], key=lambda v: v.severity_rank
+        )
 
-        html = GrypeScanner._vulns_to_html(image, os_vulns, lib_vulns, config.show_links, show_epss=True)
+        html = GrypeScanner._vulns_to_html(
+            image, os_vulns, lib_vulns, config.show_links, show_epss=True
+        )
         with open(html_file_path, "w") as f:
             f.write(html)
         return html_file_path
@@ -270,7 +300,20 @@ class TrivyScanner(ImageScanner):
     def _parse_trivy_json(data, allowed) -> list[Vulnerability]:
         """Parse Trivy JSON output into Vulnerability objects."""
         vulns = []
-        os_types = {"debian", "ubuntu", "alpine", "amazon", "oracle", "redhat", "centos", "rocky", "alma", "suse", "photon", "cbl-mariner"}
+        os_types = {
+            "debian",
+            "ubuntu",
+            "alpine",
+            "amazon",
+            "oracle",
+            "redhat",
+            "centos",
+            "rocky",
+            "alma",
+            "suse",
+            "photon",
+            "cbl-mariner",
+        }
         for result in data.get("Results", []):
             result_class = result.get("Class", "")
             result_type = result.get("Type", "").lower()
@@ -282,15 +325,17 @@ class TrivyScanner(ImageScanner):
                 if sev not in allowed:
                     continue
                 pkg_type = "deb" if is_os else result_type
-                vulns.append(Vulnerability(
-                    pkg_name=v.get("PkgName", ""),
-                    vulnerability_id=v.get("VulnerabilityID", ""),
-                    severity=sev,
-                    installed_version=v.get("InstalledVersion", ""),
-                    fixed_version=v.get("FixedVersion", ""),
-                    links=v.get("References", []) if v.get("References") else [],
-                    pkg_type=pkg_type,
-                ))
+                vulns.append(
+                    Vulnerability(
+                        pkg_name=v.get("PkgName", ""),
+                        vulnerability_id=v.get("VulnerabilityID", ""),
+                        severity=sev,
+                        installed_version=v.get("InstalledVersion", ""),
+                        fixed_version=v.get("FixedVersion", ""),
+                        links=v.get("References", []) if v.get("References") else [],
+                        pkg_type=pkg_type,
+                    )
+                )
         return vulns
 
 
@@ -342,10 +387,16 @@ class GrypeScanner(ImageScanner):
             vulns = _enrich_and_filter_epss(vulns, config.min_epss)
 
         show_epss = config.min_epss is not None
-        os_vulns = sorted([v for v in vulns if v.is_os_package], key=lambda v: v.severity_rank)
-        lib_vulns = sorted([v for v in vulns if not v.is_os_package], key=lambda v: v.severity_rank)
+        os_vulns = sorted(
+            [v for v in vulns if v.is_os_package], key=lambda v: v.severity_rank
+        )
+        lib_vulns = sorted(
+            [v for v in vulns if not v.is_os_package], key=lambda v: v.severity_rank
+        )
 
-        html = self._vulns_to_html(image, os_vulns, lib_vulns, config.show_links, show_epss)
+        html = self._vulns_to_html(
+            image, os_vulns, lib_vulns, config.show_links, show_epss
+        )
         with open(html_file_path, "w") as f:
             f.write(html)
         return html_file_path
@@ -362,15 +413,17 @@ class GrypeScanner(ImageScanner):
             pkg = m.get("artifact", {})
             vuln = m.get("vulnerability", {})
             fix_versions = vuln.get("fix", {}).get("versions", [])
-            vulns.append(Vulnerability(
-                pkg_name=pkg.get("name", ""),
-                vulnerability_id=vuln.get("id", ""),
-                severity=sev,
-                installed_version=pkg.get("version", ""),
-                fixed_version=", ".join(fix_versions) if fix_versions else "",
-                links=vuln.get("urls", []),
-                pkg_type=pkg.get("type", "").lower(),
-            ))
+            vulns.append(
+                Vulnerability(
+                    pkg_name=pkg.get("name", ""),
+                    vulnerability_id=vuln.get("id", ""),
+                    severity=sev,
+                    installed_version=pkg.get("version", ""),
+                    fixed_version=", ".join(fix_versions) if fix_versions else "",
+                    links=vuln.get("urls", []),
+                    pkg_type=pkg.get("type", "").lower(),
+                )
+            )
         return vulns
 
     @staticmethod
@@ -382,7 +435,10 @@ class GrypeScanner(ImageScanner):
             total_cols += 1
         lines = [f'    <h2 class="image-title">{_esc(image)}</h2>', "    <table>"]
 
-        for section_name, vulns in [("OS Vulnerabilities", os_vulns), ("Library Vulnerabilities", lib_vulns)]:
+        for section_name, vulns in [
+            ("OS Vulnerabilities", os_vulns),
+            ("Library Vulnerabilities", lib_vulns),
+        ]:
             lines.append(
                 f'      <tr class="group-header"><th colspan="{total_cols}">{section_name}</th></tr>'
             )
@@ -400,7 +456,9 @@ class GrypeScanner(ImageScanner):
                 for v in vulns:
                     epss_td = ""
                     if show_epss:
-                        epss_val = f"{v.epss_score:.4f}" if v.epss_score is not None else "N/A"
+                        epss_val = (
+                            f"{v.epss_score:.4f}" if v.epss_score is not None else "N/A"
+                        )
                         epss_td = f'<td class="epss">{_esc(epss_val)}</td>'
                     links_td = ""
                     if show_links:
@@ -411,10 +469,10 @@ class GrypeScanner(ImageScanner):
                     lines.append(
                         f'      <tr class="severity-{_esc(v.severity)}">'
                         f'<td class="pkg-name">{_esc(v.pkg_name)}</td>'
-                        f'<td>{_esc(v.vulnerability_id)}</td>'
+                        f"<td>{_esc(v.vulnerability_id)}</td>"
                         f'<td class="severity">{_esc(v.severity)}</td>'
                         f'<td class="pkg-version">{_esc(v.installed_version)}</td>'
-                        f'<td>{_esc(v.fixed_version)}</td>'
+                        f"<td>{_esc(v.fixed_version)}</td>"
                         + epss_td
                         + links_td
                         + "</tr>"
@@ -431,7 +489,6 @@ SCANNER_CLASSES: dict[Scanner, type[ImageScanner]] = {
 
 
 class VulnerabilityScanner:
-
     @staticmethod
     def get_all_images(repo, version=None):
         """Pull the chart to a temp dir, recursively scan all YAML files for image references."""
@@ -810,12 +867,13 @@ class VulnerabilityScanner:
         exclude_re = re.compile(config.exclude_regex) if config.exclude_regex else None
 
         scannable = [
-            img for img in self.images
+            img
+            for img in self.images
             if not any(p in img for p in config.exclude_patterns)
             and not (exclude_re and exclude_re.search(img))
         ]
 
-        valid_image_re = re.compile(r'^[a-zA-Z0-9._\-/]+:[a-zA-Z0-9._\-]+$')
+        valid_image_re = re.compile(r"^[a-zA-Z0-9._\-/]+:[a-zA-Z0-9._\-]+$")
         cleaned = []
         for img in scannable:
             img = img.encode("ascii", "ignore").decode("ascii").strip().rstrip(":")
@@ -930,11 +988,16 @@ class VulnerabilityScanner:
                 f"Vulnerability scanning complete. Report saved as {report_file_path}"
             )
 
-        final_report = pdf_report_path if os.path.exists(pdf_report_path) else report_file_path
+        final_report = (
+            pdf_report_path if os.path.exists(pdf_report_path) else report_file_path
+        )
         if config.slack_token and config.slack_channel and os.path.exists(final_report):
             self._send_to_slack(
-                final_report, config.slack_token, config.slack_channel,
-                config.slack_mention, self.scanner.label,
+                final_report,
+                config.slack_token,
+                config.slack_channel,
+                config.slack_mention,
+                self.scanner.label,
             )
 
     @staticmethod
@@ -948,7 +1011,9 @@ class VulnerabilityScanner:
                 r'(<tr class="severity-(CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN)">.*?</tr>)',
                 re.DOTALL,
             )
-            sev_key = lambda r: Severity[r[1]].value if r[1] in Severity.__members__ else 99
+
+            def sev_key(r):
+                return Severity[r[1]].value if r[1] in Severity.__members__ else 99
 
             sections = re.split(
                 r'(<tr class="sub-header">.*?</tr>)', content, flags=re.DOTALL
@@ -976,7 +1041,13 @@ class VulnerabilityScanner:
             logging.warning(f"Could not sort report by severity: {e}")
 
     @staticmethod
-    def _send_to_slack(report_path, slack_token, slack_channel, slack_mention=None, scanner_label="Trivy"):
+    def _send_to_slack(
+        report_path,
+        slack_token,
+        slack_channel,
+        slack_mention=None,
+        scanner_label="Trivy",
+    ):
         """Upload the report file to a Slack channel and optionally mention a user/group."""
         if not slack_token or not slack_channel:
             return
@@ -1006,7 +1077,9 @@ class VulnerabilityScanner:
                 url_data = json.loads(resp.read().decode())
 
             if not url_data.get("ok"):
-                logging.error(f"Slack getUploadURLExternal failed: {url_data.get('error')}")
+                logging.error(
+                    f"Slack getUploadURLExternal failed: {url_data.get('error')}"
+                )
                 return
 
             upload_url = url_data["upload_url"]
@@ -1046,7 +1119,9 @@ class VulnerabilityScanner:
             if complete_data.get("ok"):
                 logging.info("Report uploaded to Slack successfully.")
             else:
-                logging.error(f"Slack completeUploadExternal failed: {complete_data.get('error')}")
+                logging.error(
+                    f"Slack completeUploadExternal failed: {complete_data.get('error')}"
+                )
 
         except Exception as e:
             logging.error(f"Failed to send report to Slack: {e}")
