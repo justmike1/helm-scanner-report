@@ -1,7 +1,10 @@
-name: "Helm Trivy Report"
-description: "Scan all container images in a Helm chart for vulnerabilities using Trivy and generate a consolidated HTML/PDF report."
+name: "Helm Scanner Report"
+description: "Scan all container images in a Helm chart for vulnerabilities using Trivy or Grype and generate a consolidated HTML/PDF report."
 
 inputs:
+  scanner:
+    description: "Vulnerability scanner to use (trivy or grype)."
+    required: true
   repo:
     description: "Helm chart repository/path to scan (e.g. oci://..., ./chart, or a .tgz file path)."
     required: true
@@ -44,7 +47,7 @@ inputs:
   artifact-name:
     description: "Name of the uploaded artifact."
     required: false
-    default: "trivy-vulnerability-report"
+    default: "vulnerability-report"
   retention-days:
     description: "Number of days to retain the uploaded artifact."
     required: false
@@ -70,14 +73,26 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Install Trivy
+    - name: Install Scanner
       shell: bash
       run: |
-        if ! command -v trivy &> /dev/null; then
-          echo "Installing Trivy..."
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        if [ "${{ inputs.scanner }}" = "trivy" ]; then
+          if ! command -v trivy &> /dev/null; then
+            echo "Installing Trivy..."
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          else
+            echo "Trivy already installed: $(trivy --version)"
+          fi
+        elif [ "${{ inputs.scanner }}" = "grype" ]; then
+          if ! command -v grype &> /dev/null; then
+            echo "Installing Grype..."
+            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          else
+            echo "Grype already installed: $(grype version)"
+          fi
         else
-          echo "Trivy already installed: $(trivy --version)"
+          echo "::error::Unknown scanner '${{ inputs.scanner }}'. Must be 'trivy' or 'grype'."
+          exit 1
         fi
 
     - name: Install Helm
@@ -90,10 +105,8 @@ runs:
           echo "Helm already installed: $(helm version --short)"
         fi
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.x"
+    - name: Install uv
+      uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
 
     - name: Resolve action root
       id: root
@@ -102,15 +115,16 @@ runs:
 
     - name: Install Python dependencies
       shell: bash
-      run: pip install -r "${{ steps.root.outputs.path }}/requirements.txt"
+      working-directory: ${{ steps.root.outputs.path }}
+      run: uv sync --no-config
 
-    - name: Run Trivy vulnerability scan
+    - name: Run vulnerability scan
       id: scan
       shell: bash
       env:
         ACTION_ROOT: ${{ steps.root.outputs.path }}
       run: |
-        ARGS="--repo ${{ inputs.repo }}"
+        ARGS="--repo ${{ inputs.repo }} --scanner ${{ inputs.scanner }}"
 
         if [ -n "${{ inputs.version }}" ]; then
           ARGS="$ARGS --version ${{ inputs.version }}"
@@ -148,7 +162,7 @@ runs:
           ARGS="$ARGS --slack-mention \"${{ inputs.slack-mention }}\""
         fi
 
-        python "$ACTION_ROOT/src/scan.py" $ARGS
+        uv run --no-config python "$ACTION_ROOT/src/scan.py" $ARGS
 
         # Detect generated report (PDF preferred, fall back to HTML)
         if [ -f "report.pdf" ]; then

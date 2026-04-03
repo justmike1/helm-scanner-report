@@ -63,5 +63,5 @@
     {{- end }}
     </table>
     {{- else }}
-    <p>Trivy Returned Empty Report</p>
+    <p>Scanner Returned Empty Report</p>
     {{- end }}

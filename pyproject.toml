@@ -1,0 +1,15 @@
+[project]
+name = "helm-scanner-report"
+version = "0.1.0"
+description = "Scan Helm charts for vulnerabilities using Trivy or Grype"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0.2",
+]
+
+[project.scripts]
+helm-vuln-scan = "src.scan:main"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple/"
+name = "pypi"

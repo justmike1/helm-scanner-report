@@ -1,5 +1,5 @@
-# helm-trivy-report
-Scans all container images in a Helm chart for known vulnerabilities using Trivy and generates a consolidated PDF/HTML report, sorted by severity. Supports local charts, remote repos, custom registries, image exclusions, and configurable severity levels.
+# helm-scanner-report
+Scans all container images in a Helm chart for known vulnerabilities using Trivy or Grype and generates a consolidated PDF/HTML report, sorted by severity. Supports local charts, remote repos, custom registries, image exclusions, and configurable severity levels.
 
 ## Example Report
 
@@ -8,13 +8,13 @@ Scans all container images in a Helm chart for known vulnerabilities using Trivy
 ## Project Structure
 
 ```
-├── .github/actions/trivy-report/   # Reusable GitHub composite action
+├── .github/actions/scanner-report/  # Reusable GitHub composite action
 │   └── action.yml
 ├── src/
-│   ├── scan.py                     # Main vulnerability scanner
+│   ├── scan.py                      # Main vulnerability scanner
 │   └── templates/
-│       └── html.tpl                # HTML report template (links toggled at build time)
-├── requirements.txt                # Python dependencies
+│       └── html.tpl                 # HTML report template (links toggled at build time)
+├── pyproject.toml                   # Python project (uv)
 ├── README.md
 └── LICENSE
 ```
@@ -25,12 +25,13 @@ Other repositories can use this as a reusable composite action:
 
 ```yaml
 jobs:
-  trivy-scan:
+  vuln-scan:
     runs-on: ubuntu-latest
     steps:
       - name: Scan Helm chart for vulnerabilities
-        uses: justmike1/helm-trivy-report/.github/actions/trivy-report@main
+        uses: justmike1/helm-scanner-report/.github/actions/scanner-report@main
         with:
+          scanner: "trivy"                # required – trivy or grype
           repo: "oci://registry.example.com/my-chart"
           version: "1.0.0"               # optional
           registry: ""                    # optional – override image registry
@@ -41,7 +42,7 @@ jobs:
           retries: "3"                    # optional (default: 3)
           log-level: "INFO"               # optional (default: INFO)
           upload-artifact: "true"         # optional (default: true)
-          artifact-name: "trivy-report"   # optional (default: trivy-vulnerability-report)
+          artifact-name: "vuln-report"    # optional (default: vulnerability-report)
           retention-days: "3"             # optional (default: 3)
           slack-token: ${{ secrets.SLACK_BOT_TOKEN }}  # optional
           slack-channel: "C0A6S3KNNLW"    # optional – Slack channel ID
@@ -49,9 +50,9 @@ jobs:
 ```
 
 The action will:
-1. Install Trivy, Helm, and Python dependencies automatically
+1. Install the chosen scanner (Trivy or Grype), Helm, and Python dependencies automatically
 2. Pull the Helm chart and discover all container images
-3. Scan each image with Trivy
+3. Scan each image with the selected scanner
 4. Generate a consolidated report sorted by severity
 5. Upload the report as a GitHub Actions artifact
 6. Optionally send the report to a Slack channel
@@ -72,6 +73,7 @@ After installing the app to your workspace, **invite the bot to the target chann
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
+| `scanner` | **yes** | — | Vulnerability scanner to use (`trivy` or `grype`) |
 | `repo` | **yes** | — | Helm chart repository/path to scan |
 | `version` | no | `""` | Helm chart version |
 | `registry` | no | `""` | Registry prefix for images |
@@ -82,7 +84,7 @@ After installing the app to your workspace, **invite the bot to the target chann
 | `retries` | no | `3` | Retry count for failed scans |
 | `log-level` | no | `INFO` | Log level |
 | `upload-artifact` | no | `true` | Upload report as artifact |
-| `artifact-name` | no | `trivy-vulnerability-report` | Artifact name |
+| `artifact-name` | no | `vulnerability-report` | Artifact name |
 | `retention-days` | no | `3` | Number of days to retain the artifact |
 | `slack-token` | no | `""` | Slack Bot OAuth token for uploading the report |
 | `slack-channel` | no | `""` | Slack channel ID to send the report to |
@@ -97,27 +99,38 @@ After installing the app to your workspace, **invite the bot to the target chann
 ## Local CLI Usage
 
 ```bash
-pip install -r requirements.txt
+uv sync --no-config
 
-# Scan a local chart archive with a custom registry, filtering only critical and high severities
-python src/scan.py \
+# Scan with Trivy
+uv run --no-config python src/scan.py \
+  --scanner trivy \
+  --repo path/to/my-chart-1.0.0.tgz \
+  --registry AWS_ACCOUNT_ID.dkr.ecr.eu-central-1.amazonaws.com \
+  --severity-levels CRITICAL,HIGH
+
+# Scan with Grype
+uv run --no-config python src/scan.py \
+  --scanner grype \
   --repo path/to/my-chart-1.0.0.tgz \
   --registry AWS_ACCOUNT_ID.dkr.ecr.eu-central-1.amazonaws.com \
   --severity-levels CRITICAL,HIGH
 
 # Exclude images by substring or regex
-python src/scan.py \
+uv run --no-config python src/scan.py \
+  --scanner trivy \
   --repo ./helm \
   --exclude-images postgresql,redis \
   --exclude-images-regex 'tickets-.*|legacy-'
 
 # Scan a remote chart
-python src/scan.py \
+uv run --no-config python src/scan.py \
+  --scanner grype \
   --repo oci://registry.example.com/my-chart \
   --version 1.0.0
 
 # Scan and send report to Slack
-python src/scan.py \
+uv run --no-config python src/scan.py \
+  --scanner trivy \
   --repo path/to/my-chart-1.0.0.tgz \
   --registry AWS_ACCOUNT_ID.dkr.ecr.eu-central-1.amazonaws.com \
   --severity-levels CRITICAL,HIGH \

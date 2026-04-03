@@ -1,5 +1,6 @@
 import argparse
 import glob
+import html as html_mod
 import json
 import logging
 import os
@@ -11,190 +12,99 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
 
 import yaml
 
-SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
+
+class Severity(Enum):
+    CRITICAL = 0
+    HIGH = 1
+    MEDIUM = 2
+    LOW = 3
+    UNKNOWN = 4
 
 
-class VulnerabilityScanner:
+class Scanner(Enum):
+    TRIVY = "trivy"
+    GRYPE = "grype"
+
+
+@dataclass
+class Vulnerability:
+    pkg_name: str
+    vulnerability_id: str
+    severity: str
+    installed_version: str
+    fixed_version: str
+    links: list[str] = field(default_factory=list)
+    pkg_type: str = ""
+
+    @property
+    def is_os_package(self) -> bool:
+        return self.pkg_type in {"deb", "rpm", "apk"}
+
+    @property
+    def severity_rank(self) -> int:
+        return Severity[self.severity].value if self.severity in Severity.__members__ else 99
+
+
+@dataclass
+class ScanConfig:
+    show_links: bool = True
+    severity_levels: str = "LOW,MEDIUM,HIGH,CRITICAL"
+    retries: int = 3
+    exclude_patterns: list[str] = field(default_factory=list)
+    exclude_regex: str | None = None
+    slack_token: str | None = None
+    slack_channel: str | None = None
+    slack_mention: str | None = None
+
+
+def _esc(text) -> str:
+    return html_mod.escape(str(text))
+
+
+class ImageScanner(ABC):
     MAX_RETRIES = 3
     RETRY_DELAY = 5
 
-    @staticmethod
-    def get_all_images(repo, version=None):
-        """Pull the chart to a temp dir, recursively scan all YAML files for image references."""
-        tmp_dir = tempfile.mkdtemp(prefix="vuln-scan-")
-        logging.info(f"Pulling chart to {tmp_dir}")
+    def __init__(self):
+        self.html_files: list[str] = []
 
-        try:
-            # Extract chart into tmp dir
-            if os.path.isfile(repo) and (
-                repo.endswith(".tgz") or repo.endswith(".tar.gz")
-            ):
-                # Local .tgz archive — extract directly
-                logging.info(f"Extracting local chart archive: {repo}")
-                with tarfile.open(repo, "r:gz") as tar:
-                    tar.extractall(path=tmp_dir)
-            elif os.path.isdir(repo):
-                # Local chart directory — copy it
-                logging.info(f"Copying local chart directory: {repo}")
-                chart_name = os.path.basename(os.path.normpath(repo))
-                shutil.copytree(repo, os.path.join(tmp_dir, chart_name))
-            else:
-                # Remote repo — use helm pull
-                pull_cmd = ["helm", "pull", repo, "--untar", "--destination", tmp_dir]
-                if version:
-                    pull_cmd += ["--version", version]
-                logging.debug(f"Running: {' '.join(pull_cmd)}")
-                result = subprocess.run(pull_cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    logging.error(
-                        f"Helm pull failed (exit {result.returncode}):\n{result.stderr}"
-                    )
-                    return set()
+    @property
+    @abstractmethod
+    def label(self) -> str: ...
 
-            # Recursively find all .yaml and .yml files only under charts/ directories
-            yaml_files = [
-                f
-                for f in glob.glob(
-                    os.path.join(tmp_dir, "**", "*.yaml"), recursive=True
-                )
-                + glob.glob(os.path.join(tmp_dir, "**", "*.yml"), recursive=True)
-                if os.sep + "charts" + os.sep in f
-            ]
-            logging.info(f"Found {len(yaml_files)} YAML files in sub-charts")
+    @abstractmethod
+    def scan_image(self, image: str, config: ScanConfig) -> str | None: ...
 
-            images = set()
-            image_pattern = re.compile(
-                r"""(?:image|repository)["']?\s*:\s*["']?([a-zA-Z0-9._\-/]+(?::[a-zA-Z0-9._\-]+)?)["']?"""
-            )
+    def _register_html(self, image: str) -> str:
+        name = f"{image.replace('/', '_').replace(':', '_')}.html"
+        path = os.path.join(os.getcwd(), name)
+        if path not in self.html_files:
+            self.html_files.append(path)
+        return path
 
-            for yaml_file in yaml_files:
-                try:
-                    with open(yaml_file, "r") as f:
-                        content = f.read()
 
-                    # Parse YAML to find image fields in structured data
-                    try:
-                        docs = list(yaml.safe_load_all(content))
-                    except yaml.YAMLError:
-                        docs = []
-
-                    VulnerabilityScanner._extract_images_from_yaml(docs, images)
-
-                    # Also do regex scan for image references that may be in templates
-                    for line in content.splitlines():
-                        stripped = line.strip()
-                        # Skip commented lines and template-only lines
-                        if stripped.startswith("#"):
-                            continue
-                        match = image_pattern.search(stripped)
-                        if match:
-                            img = match.group(1)
-                            # Filter out template placeholders and null values
-                            if "{{" not in img and img not in ("null", "None", ""):
-                                images.add(img)
-
-                except Exception as e:
-                    logging.debug(f"Error reading {yaml_file}: {e}")
-
-            logging.info(f"Found {len(images)} unique images")
-            for img in sorted(images):
-                logging.debug(f"  Image: {img}")
-            if not images:
-                logging.warning("No images found in chart files.")
-            return images
-
-        finally:
-            logging.debug(f"Cleaning up temp dir: {tmp_dir}")
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    @staticmethod
-    def _extract_images_from_yaml(obj, images):
-        """Recursively walk parsed YAML to find image references."""
-        if isinstance(obj, dict):
-            # Check for image dict with repository field (e.g. image.repository: "accounts-service")
-            if "image" in obj and isinstance(obj["image"], dict):
-                img_dict = obj["image"]
-                if "repository" in img_dict:
-                    repo = str(img_dict["repository"])
-                    tag = str(img_dict.get("tag", "latest") or "latest")
-                    if "{{" not in repo and repo not in ("null", "None", ""):
-                        images.add(f"{repo}:{tag}")
-            # Check for image field directly as a string
-            elif "image" in obj:
-                val = obj["image"]
-                if (
-                    isinstance(val, str)
-                    and "{{" not in val
-                    and val not in ("null", "None", "")
-                ):
-                    images.add(val)
-
-            # Check for standalone repository + tag pattern (not nested under image)
-            if "repository" in obj and "tag" in obj and "image" not in obj:
-                repo = str(obj["repository"])
-                tag = str(obj.get("tag", "latest") or "latest")
-                if "{{" not in repo and repo not in ("null", "None", ""):
-                    images.add(f"{repo}:{tag}")
-
-            for value in obj.values():
-                VulnerabilityScanner._extract_images_from_yaml(value, images)
-        elif isinstance(obj, list):
-            for item in obj:
-                VulnerabilityScanner._extract_images_from_yaml(item, images)
-
-    def __init__(self, repo, version=None, registry=None):
-        self.images = self.get_all_images(repo, version)
-        if registry:
-            self.images = self._apply_registry(self.images, registry)
-        self.html_files = []
-
-    @staticmethod
-    def _apply_registry(images, registry):
-        """Prefix images with the given registry. Strips existing registry if present."""
-        registry = registry.rstrip("/")
-        updated = set()
-        for img in images:
-            # Split image into name:tag
-            if ":" in img:
-                name, tag = img.rsplit(":", 1)
-            else:
-                name, tag = img, "latest"
-
-            # Strip existing registry — keep only the last path segment(s) as the service name
-            # e.g. "docker.io/library/nginx" -> "nginx", "quay.io/org/svc" -> "org/svc"
-            parts = name.split("/")
-            if "." in parts[0] or ":" in parts[0]:
-                # First segment looks like a registry (contains dot or port), strip it
-                service_name = "/".join(parts[1:])
-            else:
-                service_name = name
-
-            new_image = f"{registry}/{service_name}:{tag}"
-            logging.debug(f"Registry rewrite: {img} -> {new_image}")
-            updated.add(new_image)
-        logging.info(f"Applied registry prefix: {registry} to {len(updated)} images")
-        return updated
+class TrivyScanner(ImageScanner):
+    @property
+    def label(self) -> str:
+        return "Trivy"
 
     @staticmethod
     def _process_template(template_path, show_links):
-        """Preprocess the HTML template to include/exclude links sections.
-
-        Conditional blocks are marked with {{/* LINKS_ONLY */}} ... {{/* END_LINKS_ONLY */}}.
-        The placeholder __TOTAL_COLS__ is replaced with the correct colspan value.
-        """
+        """Preprocess the HTML template to include/exclude links sections."""
         with open(template_path, "r") as f:
             content = f.read()
 
         if show_links:
-            # Keep LINKS_ONLY block contents, strip the markers
             content = content.replace("{{/* LINKS_ONLY */}}\n", "")
             content = content.replace("{{/* END_LINKS_ONLY */}}\n", "")
             content = content.replace("__TOTAL_COLS__", "6")
         else:
-            # Remove LINKS_ONLY blocks entirely (markers + content)
             content = re.sub(
                 r"\{\{/\* LINKS_ONLY \*/\}\}\n.*?\{\{/\* END_LINKS_ONLY \*/\}\}\n",
                 "",
@@ -208,9 +118,334 @@ class VulnerabilityScanner:
         tmp.close()
         return tmp.name
 
+    def scan_image(self, image, config):
+        html_file_path = self._register_html(image)
+
+        templates_dir = os.path.join(
+            os.path.abspath(os.path.dirname(__file__)), "templates"
+        )
+        template_path = os.path.join(templates_dir, "html.tpl")
+        processed_template = self._process_template(template_path, config.show_links)
+
+        try:
+            trivy_cmd = [
+                "trivy",
+                "image",
+                "-q",
+                "--severity",
+                config.severity_levels,
+                "-f",
+                "template",
+                "--template",
+                f"@{processed_template}",
+                "-o",
+                html_file_path,
+                "--scanners",
+                "vuln",
+                image,
+            ]
+
+            retries = 0
+            while retries < self.MAX_RETRIES:
+                logging.debug("Running command: %s", " ".join(trivy_cmd))
+                result = subprocess.run(trivy_cmd, capture_output=True, text=True)
+
+                if result.returncode == 0:
+                    logging.info(f"Trivy scan completed for image {image}")
+                    return html_file_path
+                elif "TOOMANYREQUESTS" in result.stderr:
+                    retries += 1
+                    logging.warning(
+                        f"Rate limit error for image {image}. Retrying {retries}/{self.MAX_RETRIES} after {self.RETRY_DELAY} seconds."
+                    )
+                    time.sleep(self.RETRY_DELAY)
+                else:
+                    logging.error(f"Error running Trivy for image {image}: {result.stderr}")
+                    return None
+
+            logging.error(
+                f"Trivy scan failed after {self.MAX_RETRIES} retries for image {image}"
+            )
+            return None
+        finally:
+            if os.path.exists(processed_template):
+                os.unlink(processed_template)
+
+
+class GrypeScanner(ImageScanner):
+    @property
+    def label(self) -> str:
+        return "Grype"
+
+    def scan_image(self, image, config):
+        html_file_path = self._register_html(image)
+        allowed = {s.strip().upper() for s in config.severity_levels.split(",")}
+
+        grype_cmd = ["grype", image, "-o", "json", "-q"]
+
+        retries = 0
+        while retries < self.MAX_RETRIES:
+            logging.debug("Running command: %s", " ".join(grype_cmd))
+            result = subprocess.run(grype_cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                logging.info(f"Grype scan completed for image {image}")
+                break
+            elif "TOOMANYREQUESTS" in result.stderr or "429" in result.stderr:
+                retries += 1
+                logging.warning(
+                    f"Rate limit error for image {image}. Retrying {retries}/{self.MAX_RETRIES} after {self.RETRY_DELAY} seconds."
+                )
+                time.sleep(self.RETRY_DELAY)
+            else:
+                logging.error(
+                    f"Error running Grype for image {repr(image)} (exit code {result.returncode}): {result.stderr.strip()}"
+                )
+                return None
+        else:
+            logging.error(
+                f"Grype scan failed after {self.MAX_RETRIES} retries for image {image}"
+            )
+            return None
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse Grype JSON output for {image}: {e}")
+            return None
+
+        vulns = self._parse_vulnerabilities(data, allowed)
+        os_vulns = sorted([v for v in vulns if v.is_os_package], key=lambda v: v.severity_rank)
+        lib_vulns = sorted([v for v in vulns if not v.is_os_package], key=lambda v: v.severity_rank)
+
+        html = self._vulns_to_html(image, os_vulns, lib_vulns, config.show_links)
+        with open(html_file_path, "w") as f:
+            f.write(html)
+        return html_file_path
+
     @staticmethod
-    def _get_report_shell(show_links=True):
+    def _parse_vulnerabilities(data, allowed) -> list[Vulnerability]:
+        vulns = []
+        for m in data.get("matches", []):
+            sev = m.get("vulnerability", {}).get("severity", "Unknown").upper()
+            if sev == "NEGLIGIBLE":
+                sev = "LOW"
+            if sev not in allowed:
+                continue
+            pkg = m.get("artifact", {})
+            vuln = m.get("vulnerability", {})
+            fix_versions = vuln.get("fix", {}).get("versions", [])
+            vulns.append(Vulnerability(
+                pkg_name=pkg.get("name", ""),
+                vulnerability_id=vuln.get("id", ""),
+                severity=sev,
+                installed_version=pkg.get("version", ""),
+                fixed_version=", ".join(fix_versions) if fix_versions else "",
+                links=vuln.get("urls", []),
+                pkg_type=pkg.get("type", "").lower(),
+            ))
+        return vulns
+
+    @staticmethod
+    def _vulns_to_html(image, os_vulns, lib_vulns, show_links):
+        total_cols = 6 if show_links else 5
+        lines = [f'    <h2 class="image-title">{_esc(image)}</h2>', "    <table>"]
+
+        for section_name, vulns in [("OS Vulnerabilities", os_vulns), ("Library Vulnerabilities", lib_vulns)]:
+            lines.append(
+                f'      <tr class="group-header"><th colspan="{total_cols}">{section_name}</th></tr>'
+            )
+            if not vulns:
+                lines.append(
+                    f'      <tr><th colspan="{total_cols}">No Vulnerabilities found</th></tr>'
+                )
+            else:
+                header_cols = "<th>Package</th><th>Vulnerability ID</th><th>Severity</th><th>Installed Version</th><th>Fixed Version</th>"
+                if show_links:
+                    header_cols += "<th>Links</th>"
+                lines.append(f'      <tr class="sub-header">{header_cols}</tr>')
+                for v in vulns:
+                    links_td = ""
+                    if show_links:
+                        link_anchors = "".join(
+                            f'<a href="{_esc(u)}">{_esc(u)}</a>' for u in v.links
+                        )
+                        links_td = f'<td class="links" data-more-links="off">{link_anchors}</td>'
+                    lines.append(
+                        f'      <tr class="severity-{_esc(v.severity)}">'
+                        f'<td class="pkg-name">{_esc(v.pkg_name)}</td>'
+                        f'<td>{_esc(v.vulnerability_id)}</td>'
+                        f'<td class="severity">{_esc(v.severity)}</td>'
+                        f'<td class="pkg-version">{_esc(v.installed_version)}</td>'
+                        f'<td>{_esc(v.fixed_version)}</td>'
+                        + links_td
+                        + "</tr>"
+                    )
+
+        lines.append("    </table>")
+        return "\n".join(lines)
+
+
+SCANNER_CLASSES: dict[Scanner, type[ImageScanner]] = {
+    Scanner.TRIVY: TrivyScanner,
+    Scanner.GRYPE: GrypeScanner,
+}
+
+
+class VulnerabilityScanner:
+
+    @staticmethod
+    def get_all_images(repo, version=None):
+        """Pull the chart to a temp dir, recursively scan all YAML files for image references."""
+        tmp_dir = tempfile.mkdtemp(prefix="vuln-scan-")
+        logging.info(f"Pulling chart to {tmp_dir}")
+
+        try:
+            if os.path.isfile(repo) and (
+                repo.endswith(".tgz") or repo.endswith(".tar.gz")
+            ):
+                logging.info(f"Extracting local chart archive: {repo}")
+                with tarfile.open(repo, "r:gz") as tar:
+                    tar.extractall(path=tmp_dir, filter="data")
+            elif os.path.isdir(repo):
+                logging.info(f"Copying local chart directory: {repo}")
+                chart_name = os.path.basename(os.path.abspath(repo))
+                shutil.copytree(repo, os.path.join(tmp_dir, chart_name))
+            else:
+                pull_cmd = ["helm", "pull", repo, "--untar", "--destination", tmp_dir]
+                if version:
+                    pull_cmd += ["--version", version]
+                logging.debug(f"Running: {' '.join(pull_cmd)}")
+                result = subprocess.run(pull_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logging.error(
+                        f"Helm pull failed (exit {result.returncode}):\n{result.stderr}"
+                    )
+                    return set()
+
+            yaml_files = [
+                f
+                for f in glob.glob(
+                    os.path.join(tmp_dir, "**", "*.yaml"), recursive=True
+                )
+                + glob.glob(os.path.join(tmp_dir, "**", "*.yml"), recursive=True)
+                if os.sep + "charts" + os.sep in f
+            ]
+            logging.debug(f"Found {len(yaml_files)} YAML files in sub-charts")
+
+            images = set()
+            image_pattern = re.compile(
+                r"""(?:image|repository)["']?\s*:\s*["']?([a-zA-Z0-9._\-/]+(?::[a-zA-Z0-9._\-]+)?)["']?"""
+            )
+
+            for yaml_file in yaml_files:
+                try:
+                    with open(yaml_file, "r") as f:
+                        content = f.read()
+
+                    try:
+                        docs = list(yaml.safe_load_all(content))
+                    except yaml.YAMLError:
+                        docs = []
+
+                    VulnerabilityScanner._extract_images_from_yaml(docs, images)
+
+                    for line in content.splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith("#"):
+                            continue
+                        match = image_pattern.search(stripped)
+                        if match:
+                            img = match.group(1).rstrip(":")
+                            if "{{" not in img and img not in ("null", "None", ""):
+                                images.add(img)
+
+                except Exception as e:
+                    logging.debug(f"Error reading {yaml_file}: {e}")
+
+            images = {img.rstrip(":") for img in images}
+            return images
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _extract_repo_tag(obj):
+        """Extract a repo:tag image string from a dict with repository/tag keys."""
+        repo = str(obj.get("repository", "")).rstrip(":")
+        tag = str(obj.get("tag", "latest") or "latest").rstrip(":")
+        if repo and "{{" not in repo and repo not in ("null", "None"):
+            return f"{repo}:{tag}"
+        return None
+
+    @staticmethod
+    def _extract_images_from_yaml(obj, images):
+        """Recursively walk parsed YAML to find image references."""
+        if isinstance(obj, dict):
+            if "image" in obj and isinstance(obj["image"], dict):
+                img = VulnerabilityScanner._extract_repo_tag(obj["image"])
+                if img:
+                    images.add(img)
+            elif "image" in obj:
+                val = obj["image"]
+                if (
+                    isinstance(val, str)
+                    and "{{" not in val
+                    and val not in ("null", "None", "")
+                ):
+                    images.add(val.rstrip(":"))
+
+            if "repository" in obj and "tag" in obj and "image" not in obj:
+                img = VulnerabilityScanner._extract_repo_tag(obj)
+                if img:
+                    images.add(img)
+
+            for value in obj.values():
+                VulnerabilityScanner._extract_images_from_yaml(value, images)
+        elif isinstance(obj, list):
+            for item in obj:
+                VulnerabilityScanner._extract_images_from_yaml(item, images)
+
+    def __init__(self, repo, version=None, registry=None, scanner_type=Scanner.TRIVY):
+        self.images = self.get_all_images(repo, version)
+        if registry:
+            self.images = self._apply_registry(self.images, registry)
+        self.scanner: ImageScanner = SCANNER_CLASSES[scanner_type]()
+
+    @staticmethod
+    def _apply_registry(images, registry):
+        """Prefix images with the given registry. Strips existing registry if present."""
+        registry = registry.rstrip("/")
+        updated = set()
+        for img in images:
+            if ":" in img:
+                name, tag = img.rsplit(":", 1)
+            else:
+                name, tag = img, "latest"
+
+            tag = tag.strip() or "latest"
+
+            parts = name.split("/")
+            if "." in parts[0] or ":" in parts[0]:
+                service_name = "/".join(parts[1:])
+            else:
+                service_name = name
+
+            new_image = f"{registry}/{service_name}:{tag}"
+            logging.debug(f"Registry rewrite: {img} -> {new_image}")
+            updated.add(new_image)
+
+        deduped = len(images) - len(updated)
+        msg = f"Applied registry prefix: {registry} to {len(updated)} images"
+        if deduped:
+            msg += f" ({deduped} duplicates removed)"
+        logging.info(msg)
+        return updated
+
+    @staticmethod
+    def _get_report_shell(show_links=True, scanner_label="Trivy"):
         """Return (header, footer) HTML strings that wrap the per-image fragments."""
+        title = f"{scanner_label} Vulnerability Report"
         links_script = ""
         if show_links:
             links_script = """
@@ -416,10 +651,10 @@ class VulnerabilityScanner:
             }}
         }}
     </style>
-    <title>Trivy Vulnerability Report</title>{links_script}
+    <title>{title}</title>{links_script}
 </head>
 <body>
-    <h1>Trivy Vulnerability Report</h1>
+    <h1>{title}</h1>
 """
 
         footer = """
@@ -428,143 +663,71 @@ class VulnerabilityScanner:
 """
         return header, footer
 
-    def run_trivy_scan(
-        self, image, show_links=True, severity_levels="LOW,MEDIUM,HIGH,CRITICAL"
-    ):
-        html_file_name = f"{image.replace('/', '_').replace(':', '_')}.html"
-        html_file_path = os.path.join(os.getcwd(), html_file_name)
-        if html_file_path not in self.html_files:
-            self.html_files.append(html_file_path)
+    def scan(self, config: ScanConfig):
+        exclude_re = re.compile(config.exclude_regex) if config.exclude_regex else None
 
-        templates_dir = os.path.join(
-            os.path.abspath(os.path.dirname(__file__)), "templates"
-        )
-        template_path = os.path.join(templates_dir, "html.tpl")
-        processed_template = self._process_template(template_path, show_links)
+        scannable = [
+            img for img in self.images
+            if not any(p in img for p in config.exclude_patterns)
+            and not (exclude_re and exclude_re.search(img))
+        ]
 
-        try:
-            trivy_cmd = [
-                "trivy",
-                "image",
-                "-q",
-                "--severity",
-                severity_levels,
-                "-f",
-                "template",
-                "--template",
-                f"@{processed_template}",
-                "-o",
-                html_file_path,
-                "--scanners",
-                "vuln",
-                image,
-            ]
-
-            retries = 0
-            while retries < self.MAX_RETRIES:
-                logging.debug("Running command: %s", " ".join(trivy_cmd))
-                result = subprocess.run(trivy_cmd, capture_output=True, text=True)
-
-                if result.returncode == 0:
-                    logging.info(f"Trivy scan completed for image {image}")
-                    return html_file_path
-                elif "TOOMANYREQUESTS" in result.stderr:
-                    retries += 1
-                    logging.warning(
-                        f"Rate limit error for image {image}. Retrying {retries}/{self.MAX_RETRIES} after {self.RETRY_DELAY} seconds."
-                    )
-                    time.sleep(self.RETRY_DELAY)
-                else:
-                    logging.error(f"Error running Trivy for image {image}: {result.stderr}")
-                    return None
-
-            logging.error(
-                f"Trivy scan failed after {self.MAX_RETRIES} retries for image {image}"
-            )
-            return None
-        finally:
-            if os.path.exists(processed_template):
-                os.unlink(processed_template)
-
-    def scan(
-        self,
-        retries=3,
-        exclude_patterns=None,
-        exclude_regex=None,
-        show_links=True,
-        severity_levels="LOW,MEDIUM,HIGH,CRITICAL",
-        slack_token=None,
-        slack_channel=None,
-        slack_mention=None,
-    ):
-        exclude_patterns = exclude_patterns or []
-        exclude_re = re.compile(exclude_regex) if exclude_regex else None
-
-        scannable = []
-        for img in self.images:
-            if any(pattern in img for pattern in exclude_patterns):
-                continue
-            if exclude_re and exclude_re.search(img):
-                continue
-            scannable.append(img)
+        valid_image_re = re.compile(r'^[a-zA-Z0-9._\-/]+:[a-zA-Z0-9._\-]+$')
+        cleaned = []
+        for img in scannable:
+            img = img.encode("ascii", "ignore").decode("ascii").strip().rstrip(":")
+            if valid_image_re.match(img):
+                cleaned.append(img)
+            else:
+                logging.warning(f"Skipping invalid image reference: {repr(img)}")
+        scannable = cleaned
 
         excluded = len(self.images) - len(scannable)
         if excluded:
             reasons = []
-            if exclude_patterns:
-                reasons.append(f"substrings: {', '.join(exclude_patterns)}")
+            if config.exclude_patterns:
+                reasons.append(f"substrings: {', '.join(config.exclude_patterns)}")
             if exclude_re:
-                reasons.append(f"regex: {exclude_regex}")
+                reasons.append(f"regex: {config.exclude_regex}")
             logging.info(
                 f"Scanning {len(scannable)} images (excluded {excluded} matching {'; '.join(reasons)})"
             )
         else:
             logging.info(f"Scanning {len(scannable)} images")
 
-        failed = []
-        for image in scannable:
-            try:
-                result = self.run_trivy_scan(
-                    image, show_links=show_links, severity_levels=severity_levels
-                )
-                if result is None:
+        def scan_images(images):
+            failed = []
+            for image in images:
+                try:
+                    if self.scanner.scan_image(image, config) is None:
+                        failed.append(image)
+                except Exception as exc:
+                    logging.error(f"Image {image} generated an exception: {exc}")
                     failed.append(image)
-            except Exception as exc:
-                logging.error(f"Image {image} generated an exception: {exc}")
-                failed.append(image)
+            return failed
 
-        # Retry failed images
-        for attempt in range(1, retries + 1):
+        failed = scan_images(scannable)
+        for attempt in range(1, config.retries + 1):
             if not failed:
                 break
             logging.info(
-                f"Retrying {len(failed)} failed images (attempt {attempt}/{retries})"
+                f"Retrying {len(failed)} failed images (attempt {attempt}/{config.retries})"
             )
-            still_failed = []
-            for image in failed:
-                try:
-                    result = self.run_trivy_scan(
-                        image, show_links=show_links, severity_levels=severity_levels
-                    )
-                    if result is None:
-                        still_failed.append(image)
-                except Exception as exc:
-                    logging.error(f"Image {image} generated an exception: {exc}")
-                    still_failed.append(image)
-            failed = still_failed
+            failed = scan_images(failed)
 
         if failed:
             logging.warning(
                 f"{len(failed)} images failed after all retries: {', '.join(failed)}"
             )
 
-        # Combine all HTML fragment files into a single report
         report_file_path = os.path.join(os.getcwd(), "report.html")
-        header, footer = self._get_report_shell(show_links=show_links)
+        header, footer = self._get_report_shell(
+            show_links=config.show_links, scanner_label=self.scanner.label
+        )
         written = 0
         with open(report_file_path, "w") as outfile:
             outfile.write(header)
-            for html_file in self.html_files:
+            for html_file in self.scanner.html_files:
                 if os.path.exists(html_file):
                     with open(html_file) as infile:
                         outfile.write(infile.read())
@@ -573,18 +736,15 @@ class VulnerabilityScanner:
                     logging.warning(f"Missing HTML report: {html_file}")
             outfile.write(footer)
         logging.info(
-            f"Combined {written}/{len(self.html_files)} scan results into report"
+            f"Combined {written}/{len(self.scanner.html_files)} scan results into report"
         )
 
-        # Sort vulnerability rows by severity (CRITICAL > HIGH > MEDIUM > LOW)
         self._sort_report_by_severity(report_file_path)
 
-        # Remove temporary per-image HTML files
-        for html_file in self.html_files:
+        for html_file in self.scanner.html_files:
             if os.path.exists(html_file):
                 os.remove(html_file)
 
-        # Convert HTML report to PDF using headless Chrome/Chromium
         pdf_report_path = report_file_path.replace(".html", ".pdf")
         chrome_path = self._find_chrome()
         if chrome_path:
@@ -627,10 +787,12 @@ class VulnerabilityScanner:
                 f"Vulnerability scanning complete. Report saved as {report_file_path}"
             )
 
-        # Send to Slack if configured
         final_report = pdf_report_path if os.path.exists(pdf_report_path) else report_file_path
-        if slack_token and slack_channel and os.path.exists(final_report):
-            self.send_to_slack(final_report, slack_token, slack_channel, slack_mention)
+        if config.slack_token and config.slack_channel and os.path.exists(final_report):
+            self._send_to_slack(
+                final_report, config.slack_token, config.slack_channel,
+                config.slack_mention, self.scanner.label,
+            )
 
     @staticmethod
     def _sort_report_by_severity(report_file_path):
@@ -639,34 +801,24 @@ class VulnerabilityScanner:
             with open(report_file_path, "r") as f:
                 content = f.read()
 
-            # Find all severity-classed <tr> blocks and sort them within each table section
             severity_row_pattern = re.compile(
                 r'(<tr class="severity-(CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN)">.*?</tr>)',
                 re.DOTALL,
             )
+            sev_key = lambda r: Severity[r[1]].value if r[1] in Severity.__members__ else 99
 
-            def sort_rows(match_section):
-                rows = severity_row_pattern.findall(match_section)
-                if not rows:
-                    return match_section
-                rows.sort(key=lambda r: SEVERITY_ORDER.get(r[1], 99))
-                return "\n".join(r[0] for r in rows)
-
-            # Split by sub-header rows to sort within each section
             sections = re.split(
                 r'(<tr class="sub-header">.*?</tr>)', content, flags=re.DOTALL
             )
             result_parts = []
-            for i, section in enumerate(sections):
+            for section in sections:
                 if 'class="sub-header"' in section:
                     result_parts.append(section)
                 elif severity_row_pattern.search(section):
-                    # Sort rows within this section
                     rows = severity_row_pattern.findall(section)
                     if rows:
-                        rows.sort(key=lambda r: SEVERITY_ORDER.get(r[1], 99))
+                        rows.sort(key=sev_key)
                         sorted_rows = "\n      ".join(r[0] for r in rows)
-                        # Replace original rows with sorted ones
                         cleaned = severity_row_pattern.sub("", section).rstrip()
                         result_parts.append(cleaned + "\n      " + sorted_rows)
                     else:
@@ -674,33 +826,27 @@ class VulnerabilityScanner:
                 else:
                     result_parts.append(section)
 
-            sorted_content = "".join(result_parts)
             with open(report_file_path, "w") as f:
-                f.write(sorted_content)
+                f.write("".join(result_parts))
             logging.info("Report sorted by severity level")
         except Exception as e:
             logging.warning(f"Could not sort report by severity: {e}")
 
     @staticmethod
-    def send_to_slack(report_path, slack_token, slack_channel, slack_mention=None):
+    def _send_to_slack(report_path, slack_token, slack_channel, slack_mention=None, scanner_label="Trivy"):
         """Upload the report file to a Slack channel and optionally mention a user/group."""
         if not slack_token or not slack_channel:
-            logging.debug("Slack token or channel not provided, skipping Slack upload.")
             return
 
         logging.info(f"Uploading report to Slack channel {slack_channel}")
-
-        # Post an initial message (with optional mention)
-        message = ":rotating_light: *Trivy Vulnerability Report*"
+        message = f":rotating_light: *{scanner_label} Vulnerability Report*"
         if slack_mention:
             message = f"{slack_mention} {message}"
 
         try:
-            # Upload the file using files.upload v2 API
             file_size = os.path.getsize(report_path)
             file_name = os.path.basename(report_path)
 
-            # Step 1: Get upload URL
             get_url_params = urllib.parse.urlencode(
                 {"filename": file_name, "length": file_size}
             ).encode()
@@ -723,7 +869,6 @@ class VulnerabilityScanner:
             upload_url = url_data["upload_url"]
             file_id = url_data["file_id"]
 
-            # Step 2: Upload file content
             with open(report_path, "rb") as f:
                 file_data = f.read()
 
@@ -736,7 +881,6 @@ class VulnerabilityScanner:
             with urllib.request.urlopen(upload_req) as resp:
                 resp.read()
 
-            # Step 3: Complete the upload and share to channel
             complete_payload = json.dumps(
                 {
                     "files": [{"id": file_id, "title": file_name}],
@@ -766,22 +910,16 @@ class VulnerabilityScanner:
 
     @staticmethod
     def _find_chrome():
-        """Find Chrome/Chromium binary on the system."""
         candidates = [
-            # macOS
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            # Linux
             "google-chrome",
             "google-chrome-stable",
             "chromium",
             "chromium-browser",
         ]
         for candidate in candidates:
-            if os.path.isfile(candidate):
-                return candidate
-            # Check if it's in PATH
-            if shutil.which(candidate):
+            if os.path.isfile(candidate) or shutil.which(candidate):
                 return candidate
         return None
 
@@ -791,6 +929,13 @@ def main():
         description="Scan a Helm chart for vulnerabilities."
     )
     parser.add_argument("--repo", type=str, help="The Helm chart repository to scan.")
+    parser.add_argument(
+        "--scanner",
+        type=lambda s: Scanner(s),
+        choices=list(Scanner),
+        required=True,
+        help="Vulnerability scanner to use (trivy or grype).",
+    )
     parser.add_argument(
         "--version",
         type=str,
@@ -863,15 +1008,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # Configure logging
     logging.basicConfig(level=args.log_level, format="[%(levelname)s] %(message)s")
-
-    # Create a handler for stdout if it doesn't already exist
-    stdout_handler = logging.StreamHandler()
-    stdout_handler.setLevel(args.log_level)
-    logger = logging.getLogger()
-    if not logger.handlers:
-        logger.addHandler(stdout_handler)
 
     if not args.repo:
         parser.error("--repo argument is required.")
@@ -881,20 +1018,22 @@ def main():
         if args.exclude_images
         else []
     )
-    scanner = VulnerabilityScanner(args.repo, args.version, args.registry)
-    severity = ",".join(
-        s.strip().upper() for s in args.severity_levels.split(",") if s.strip()
-    )
-    scanner.scan(
+
+    config = ScanConfig(
+        show_links=args.show_links,
+        severity_levels=",".join(
+            s.strip().upper() for s in args.severity_levels.split(",") if s.strip()
+        ),
         retries=args.retries,
         exclude_patterns=exclude_patterns,
         exclude_regex=args.exclude_images_regex,
-        show_links=args.show_links,
-        severity_levels=severity,
         slack_token=args.slack_token,
         slack_channel=args.slack_channel,
         slack_mention=args.slack_mention,
     )
+
+    scanner = VulnerabilityScanner(args.repo, args.version, args.registry, args.scanner)
+    scanner.scan(config)
 
 
 if __name__ == "__main__":
