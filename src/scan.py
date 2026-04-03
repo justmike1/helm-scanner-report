@@ -41,6 +41,7 @@ class Vulnerability:
     fixed_version: str
     links: list[str] = field(default_factory=list)
     pkg_type: str = ""
+    epss_score: float | None = None
 
     @property
     def is_os_package(self) -> bool:
@@ -61,10 +62,54 @@ class ScanConfig:
     slack_token: str | None = None
     slack_channel: str | None = None
     slack_mention: str | None = None
+    min_epss: float | None = None
 
 
 def _esc(text) -> str:
     return html_mod.escape(str(text))
+
+
+def _fetch_epss_scores(cve_ids: list[str]) -> dict[str, float]:
+    """Fetch EPSS scores from FIRST.org API for a list of CVE IDs."""
+    if not cve_ids:
+        return {}
+
+    scores: dict[str, float] = {}
+    batch_size = 100
+    for i in range(0, len(cve_ids), batch_size):
+        batch = cve_ids[i:i + batch_size]
+        params = urllib.parse.urlencode({"cve": ",".join(batch)})
+        url = f"https://api.first.org/data/v1/epss?{params}"
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+            for entry in data.get("data", []):
+                cve = entry.get("cve", "")
+                try:
+                    scores[cve] = float(entry.get("epss", 0))
+                except (ValueError, TypeError):
+                    pass
+        except Exception as e:
+            logging.warning(f"Failed to fetch EPSS scores for batch: {e}")
+    return scores
+
+
+def _enrich_and_filter_epss(vulns: list[Vulnerability], min_epss: float | None) -> list[Vulnerability]:
+    """Enrich vulnerabilities with EPSS scores and optionally filter by minimum."""
+    cve_ids = [v.vulnerability_id for v in vulns if v.vulnerability_id.startswith("CVE-")]
+    if not cve_ids:
+        return vulns
+
+    scores = _fetch_epss_scores(cve_ids)
+    for v in vulns:
+        if v.vulnerability_id in scores:
+            v.epss_score = scores[v.vulnerability_id]
+
+    if min_epss is not None:
+        vulns = [v for v in vulns if v.epss_score is not None and v.epss_score >= min_epss]
+
+    return vulns
 
 
 class ImageScanner(ABC):
@@ -121,6 +166,12 @@ class TrivyScanner(ImageScanner):
     def scan_image(self, image, config):
         html_file_path = self._register_html(image)
 
+        if config.min_epss is not None:
+            return self._scan_image_json(image, config, html_file_path)
+
+        return self._scan_image_template(image, config, html_file_path)
+
+    def _scan_image_template(self, image, config, html_file_path):
         templates_dir = os.path.join(
             os.path.abspath(os.path.dirname(__file__)), "templates"
         )
@@ -129,19 +180,12 @@ class TrivyScanner(ImageScanner):
 
         try:
             trivy_cmd = [
-                "trivy",
-                "image",
-                "-q",
-                "--severity",
-                config.severity_levels,
-                "-f",
-                "template",
-                "--template",
-                f"@{processed_template}",
-                "-o",
-                html_file_path,
-                "--scanners",
-                "vuln",
+                "trivy", "image", "-q",
+                "--severity", config.severity_levels,
+                "-f", "template",
+                "--template", f"@{processed_template}",
+                "-o", html_file_path,
+                "--scanners", "vuln",
                 image,
             ]
 
@@ -151,7 +195,7 @@ class TrivyScanner(ImageScanner):
                 result = subprocess.run(trivy_cmd, capture_output=True, text=True)
 
                 if result.returncode == 0:
-                    logging.info(f"Trivy scan completed for image {image}")
+                    logging.debug(f"Trivy scan completed for image {image}")
                     return html_file_path
                 elif "TOOMANYREQUESTS" in result.stderr:
                     retries += 1
@@ -170,6 +214,84 @@ class TrivyScanner(ImageScanner):
         finally:
             if os.path.exists(processed_template):
                 os.unlink(processed_template)
+
+    def _scan_image_json(self, image, config, html_file_path):
+        """Scan with JSON output to support EPSS filtering."""
+        allowed = {s.strip().upper() for s in config.severity_levels.split(",")}
+        trivy_cmd = [
+            "trivy", "image", "-q",
+            "--severity", config.severity_levels,
+            "-f", "json",
+            "--scanners", "vuln",
+            image,
+        ]
+
+        retries = 0
+        while retries < self.MAX_RETRIES:
+            logging.debug("Running command: %s", " ".join(trivy_cmd))
+            result = subprocess.run(trivy_cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                logging.debug(f"Trivy scan completed for image {image}")
+                break
+            elif "TOOMANYREQUESTS" in result.stderr:
+                retries += 1
+                logging.warning(
+                    f"Rate limit error for image {image}. Retrying {retries}/{self.MAX_RETRIES} after {self.RETRY_DELAY} seconds."
+                )
+                time.sleep(self.RETRY_DELAY)
+            else:
+                logging.error(f"Error running Trivy for image {image}: {result.stderr}")
+                return None
+        else:
+            logging.error(
+                f"Trivy scan failed after {self.MAX_RETRIES} retries for image {image}"
+            )
+            return None
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse Trivy JSON output for {image}: {e}")
+            return None
+
+        vulns = self._parse_trivy_json(data, allowed)
+        vulns = _enrich_and_filter_epss(vulns, config.min_epss)
+
+        os_vulns = sorted([v for v in vulns if v.is_os_package], key=lambda v: v.severity_rank)
+        lib_vulns = sorted([v for v in vulns if not v.is_os_package], key=lambda v: v.severity_rank)
+
+        html = GrypeScanner._vulns_to_html(image, os_vulns, lib_vulns, config.show_links, show_epss=True)
+        with open(html_file_path, "w") as f:
+            f.write(html)
+        return html_file_path
+
+    @staticmethod
+    def _parse_trivy_json(data, allowed) -> list[Vulnerability]:
+        """Parse Trivy JSON output into Vulnerability objects."""
+        vulns = []
+        os_types = {"debian", "ubuntu", "alpine", "amazon", "oracle", "redhat", "centos", "rocky", "alma", "suse", "photon", "cbl-mariner"}
+        for result in data.get("Results", []):
+            result_class = result.get("Class", "")
+            result_type = result.get("Type", "").lower()
+            is_os = result_class == "os-pkgs" or result_type in os_types
+            for v in result.get("Vulnerabilities", []):
+                sev = v.get("Severity", "UNKNOWN").upper()
+                if sev == "NEGLIGIBLE":
+                    sev = "LOW"
+                if sev not in allowed:
+                    continue
+                pkg_type = "deb" if is_os else result_type
+                vulns.append(Vulnerability(
+                    pkg_name=v.get("PkgName", ""),
+                    vulnerability_id=v.get("VulnerabilityID", ""),
+                    severity=sev,
+                    installed_version=v.get("InstalledVersion", ""),
+                    fixed_version=v.get("FixedVersion", ""),
+                    links=v.get("References", []) if v.get("References") else [],
+                    pkg_type=pkg_type,
+                ))
+        return vulns
 
 
 class GrypeScanner(ImageScanner):
@@ -215,10 +337,15 @@ class GrypeScanner(ImageScanner):
             return None
 
         vulns = self._parse_vulnerabilities(data, allowed)
+
+        if config.min_epss is not None:
+            vulns = _enrich_and_filter_epss(vulns, config.min_epss)
+
+        show_epss = config.min_epss is not None
         os_vulns = sorted([v for v in vulns if v.is_os_package], key=lambda v: v.severity_rank)
         lib_vulns = sorted([v for v in vulns if not v.is_os_package], key=lambda v: v.severity_rank)
 
-        html = self._vulns_to_html(image, os_vulns, lib_vulns, config.show_links)
+        html = self._vulns_to_html(image, os_vulns, lib_vulns, config.show_links, show_epss)
         with open(html_file_path, "w") as f:
             f.write(html)
         return html_file_path
@@ -247,8 +374,12 @@ class GrypeScanner(ImageScanner):
         return vulns
 
     @staticmethod
-    def _vulns_to_html(image, os_vulns, lib_vulns, show_links):
-        total_cols = 6 if show_links else 5
+    def _vulns_to_html(image, os_vulns, lib_vulns, show_links, show_epss=False):
+        total_cols = 5
+        if show_links:
+            total_cols += 1
+        if show_epss:
+            total_cols += 1
         lines = [f'    <h2 class="image-title">{_esc(image)}</h2>', "    <table>"]
 
         for section_name, vulns in [("OS Vulnerabilities", os_vulns), ("Library Vulnerabilities", lib_vulns)]:
@@ -261,10 +392,16 @@ class GrypeScanner(ImageScanner):
                 )
             else:
                 header_cols = "<th>Package</th><th>Vulnerability ID</th><th>Severity</th><th>Installed Version</th><th>Fixed Version</th>"
+                if show_epss:
+                    header_cols += "<th>EPSS</th>"
                 if show_links:
                     header_cols += "<th>Links</th>"
                 lines.append(f'      <tr class="sub-header">{header_cols}</tr>')
                 for v in vulns:
+                    epss_td = ""
+                    if show_epss:
+                        epss_val = f"{v.epss_score:.4f}" if v.epss_score is not None else "N/A"
+                        epss_td = f'<td class="epss">{_esc(epss_val)}</td>'
                     links_td = ""
                     if show_links:
                         link_anchors = "".join(
@@ -278,6 +415,7 @@ class GrypeScanner(ImageScanner):
                         f'<td class="severity">{_esc(v.severity)}</td>'
                         f'<td class="pkg-version">{_esc(v.installed_version)}</td>'
                         f'<td>{_esc(v.fixed_version)}</td>'
+                        + epss_td
                         + links_td
                         + "</tr>"
                     )
@@ -613,6 +751,11 @@ class VulnerabilityScanner:
         td.link a {{
             color: #0366d6;
             word-break: break-all;
+        }}
+        .epss {{
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+            font-size: 0.9em;
+            text-align: right;
         }}
         hr {{
             border: none;
@@ -1006,6 +1149,14 @@ def main():
         help="Slack mention to include in the message "
         '(e.g. "<!subteam^S0A6S3KNNLW>" for a user group, or "<@U012345>" for a user).',
     )
+    parser.add_argument(
+        "--min-epss",
+        type=float,
+        default=None,
+        help="Minimum EPSS score to include a vulnerability (0.0-1.0). "
+        "Only vulnerabilities with EPSS >= this value are included. "
+        "Adds an EPSS column to the report. Omit to disable EPSS filtering.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level, format="[%(levelname)s] %(message)s")
@@ -1030,6 +1181,7 @@ def main():
         slack_token=args.slack_token,
         slack_channel=args.slack_channel,
         slack_mention=args.slack_mention,
+        min_epss=args.min_epss,
     )
 
     scanner = VulnerabilityScanner(args.repo, args.version, args.registry, args.scanner)

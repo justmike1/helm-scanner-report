@@ -47,6 +47,7 @@ jobs:
           slack-token: ${{ secrets.SLACK_BOT_TOKEN }}  # optional
           slack-channel: "C0A6S3KNNLW"    # optional – Slack channel ID
           slack-mention: "<!subteam^S0A6S3KNNLW>"  # optional – tag a user group or user
+          min-epss: "0.5"                 # optional – minimum EPSS score (0.0-1.0)
 ```
 
 The action will:
@@ -89,6 +90,7 @@ After installing the app to your workspace, **invite the bot to the target chann
 | `slack-token` | no | `""` | Slack Bot OAuth token for uploading the report |
 | `slack-channel` | no | `""` | Slack channel ID to send the report to |
 | `slack-mention` | no | `""` | Slack mention to tag (e.g. `<!subteam^ID>`, `<@U...>`) |
+| `min-epss` | no | `""` | Minimum EPSS score (0.0-1.0) to include a vulnerability |
 
 ### Outputs
 
@@ -128,6 +130,12 @@ uv run --no-config python src/scan.py \
   --repo oci://registry.example.com/my-chart \
   --version 1.0.0
 
+# Filter by EPSS score (only vulns with EPSS >= 0.5)
+uv run --no-config python src/scan.py \
+  --scanner grype \
+  --repo path/to/my-chart-1.0.0.tgz \
+  --min-epss 0.5
+
 # Scan and send report to Slack
 uv run --no-config python src/scan.py \
   --scanner trivy \
@@ -139,4 +147,4 @@ uv run --no-config python src/scan.py \
   --slack-mention '<!subteam^S0A6S4KYLOW>'
 ```
 
-Run `python src/scan.py --help` for all available options.
+Run `uv run python src/scan.py --help` for all available options.

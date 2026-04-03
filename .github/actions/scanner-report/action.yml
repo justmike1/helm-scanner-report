@@ -64,6 +64,10 @@ inputs:
     description: 'Slack mention to tag in the message (e.g. "<!subteam^S0A6S3KNNLW>" or "<@U012345>").'
     required: false
     default: ""
+  min-epss:
+    description: "Minimum EPSS score (0.0-1.0) to include a vulnerability. Adds an EPSS column to the report."
+    required: false
+    default: ""
 
 outputs:
   report-path:
@@ -160,6 +164,10 @@ runs:
 
         if [ -n "${{ inputs.slack-mention }}" ]; then
           ARGS="$ARGS --slack-mention \"${{ inputs.slack-mention }}\""
+        fi
+
+        if [ -n "${{ inputs.min-epss }}" ]; then
+          ARGS="$ARGS --min-epss ${{ inputs.min-epss }}"
         fi
 
         uv run --no-config python "$ACTION_ROOT/src/scan.py" $ARGS
